@@ -1,0 +1,13 @@
+{
+  "name": "cos-grok-engine",
+  "version": "1.0.0-grok",
+  "private": true,
+  "description": "Grok COS Engine \u2014 safety-first LLM specialist orchestration with immutable control chain and restrict-only formats",
+  "main": "cos_backend.js",
+  "scripts": {
+    "start": "node cos_backend.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
