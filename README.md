@@ -10,6 +10,8 @@ It keeps the four-specialist pipeline (Researcher → Analyst → Creator → Cr
 but enforces the immutable control chain and restrict-only format model so that  
 “CrewAI-style multi-agent teams” cannot loosen safety.
 
+**Current version:** `1.1.0-grok`
+
 ---
 
 ## Core invariants (non-negotiable)
@@ -18,10 +20,10 @@ but enforces the immutable control chain and restrict-only format model so that
 Evidence → Risk classification → Approval → Execution gate → Verification → Audit
 ```
 
-| ID | Invariant | Enforcement |
-|----|-----------|-------------|
-| I-1 | Claims must be grounded in real fetched content | Code check: non-empty snippet ≥ 12 chars must appear in fetched bytes |
-| I-2 | Risk tier is software-classified, monotonic | Deterministic classifier; LLM self-tier is advisory only |
+| ID  | Invariant | Enforcement |
+|-----|-----------|-------------|
+| I-1 | Claims must be grounded in real fetched content | Code check: non-empty snippet ≥ 12 chars (or format min) must appear in fetched bytes |
+| I-2 | Risk tier is software-classified, monotonic | Deterministic classifier; LLM self-tier is advisory only; format floor is escalate-only |
 | I-3 | Medium/High require human approval from token identity | Backend decision route, transaction-checked |
 | I-4 | Nothing executes without a genuine APPROVED row (and no later REJECTED) | Unified gate in both `mission_chain.js` and `cos_backend.js` |
 | I-5 | Independent verification after (or at) the critic stage | Critic can only escalate / halt |
@@ -31,33 +33,15 @@ No format, prompt, or specialist output can reorder, skip, or weaken these steps
 
 ---
 
-## Fix for “CrewAI-style multi-agent teams”
+## What’s new in 1.1.0-grok
 
-CrewAI (and similar role-based frameworks) make it easy to define Researcher / Analyst / Writer / Critic agents.  
-The danger is that the *orchestration* becomes model-driven or configuration-driven in ways that can bypass safety.
+- Real **format loader** (`format_loader.js`) with strict validation
+- Organized directories: `formats/`, `prompts/`, `tests/`
+- Stronger unit tests for the loader and the execution gate
+- Cleaner risk-tier update path
+- Example marketing format ready to use
 
-**Grok COS solution:**
-
-1. **Roles exist only as data inside a closed manifest** (see `formats/`).
-2. **Base-role ceilings are hard** — Researcher can only read/fetch; Creator never overwrites; Critic can only escalate.
-3. **Chain templates are declared, not discovered** — the engine selects the chain deterministically. The model may *propose* optional roles, but anything outside the template is discarded.
-4. **Control chain is never part of the crew** — Evidence / Risk / Approval / Gate live in engine code, not in agent prompts.
-5. **Formats are restrict-only** — a format can raise risk floors, demand more sources, or require extra approvers. It can never lower them or invent auto-approve.
-
-Result: you get the pleasant “team of specialists” developer experience while the safety boundary remains under code control.
-
-See `formats/example_marketing.json` and `FORMAT_SPEC.md` for the declarative surface.
-
----
-
-## What was fixed from the original package
-
-| Finding | Status |
-|---------|--------|
-| F1 Empty evidence snippet counted as grounded | **Fixed** — requires non-empty trimmed snippet ≥ 12 characters |
-| F3 Duplicate / weaker gate in `mission_chain.js` | **Fixed** — now identical to `gateExecute` (checks later REJECTED) |
-| I-6 Append-only only by convention | **Hardened** — SQLite triggers raise on UPDATE/DELETE |
-| Format id / version / hash on missions | **Added** columns (ready for manifest loader) |
+See `CHANGELOG.md` for full details.
 
 ---
 
@@ -65,9 +49,17 @@ See `formats/example_marketing.json` and `FORMAT_SPEC.md` for the declarative su
 
 ```bash
 # Requires Node 22.5+ (node:sqlite)
-cp test17_schema.sql /tmp/cos.db.sql
-# Initialize DB (or let tests do it)
-node tests/test19_live_mission.js   # needs GEMINI_API_KEY for live
+cp test17_schema.sql /tmp/cos.db.sql   # or use npm run init-db
+
+# Unit tests (no API keys needed)
+npm test
+npm run test:format
+npm run test:gate
+
+# Live mission (needs keys)
+export GEMINI_API_KEY=...
+export COS_TOKEN=$(openssl rand -hex 24)
+node tests/test19_live_mission.js
 ```
 
 Environment:
@@ -76,12 +68,13 @@ Environment:
 - `GROQ_API_KEY` (optional fallback)
 - `COS_TOKEN` / `COS_TOKENS` (approver identity)
 - `COS_DB` (path to SQLite file)
+- `COS_FORMAT` (optional path to a format JSON)
 
 Backend:
 
 ```bash
 node cos_backend.js
-# Dashboard: open chief_of_staff_dashboard.html
+# Dashboard: open chief_of_staff_dashboard.html (or served at /)
 ```
 
 ---
@@ -93,14 +86,42 @@ cos-grok-engine/
 ├── mission_chain.js          # Specialist pipeline + unified gate
 ├── cos_backend.js            # Approval / execution HTTP API
 ├── provider_fallback.js      # Gemini primary, Groq fallback
+├── format_loader.js          # Restrict-only format validation & loading
 ├── test17_schema.sql         # Schema + format columns + append-only triggers
 ├── formats/                  # Declarative format manifests (data only)
-├── prompts/                  # Specialist instruction files (referenced by manifest)
-├── tests/
+│   └── example_marketing.json
+├── prompts/                  # Specialist instruction files
+├── tests/                    # All test scripts
 ├── SECURITY_BOUNDARIES.md
-├── GENERAL_CHIEF_OF_STAFF_FINAL_SPEC-1.md
-├── FORMAT_SPEC.md            # Condensed format rules
+├── FORMAT_SPEC.md
+├── CHANGELOG.md
 └── README.md
+```
+
+---
+
+## Formats (restrict-only)
+
+A format is a JSON manifest. It can:
+
+- Raise risk floors
+- Demand more sources / longer snippets
+- Require extra approvers
+- Specialize terminology and presentation
+
+It can **never**:
+
+- Auto-approve medium/high
+- Lower a risk tier
+- Skip the Critic or the approval gate
+- Inject executable code or hooks
+
+See `FORMAT_SPEC.md` and `formats/example_marketing.json`.
+
+```js
+const { loadFormat, loadDefaultFormat } = require('./format_loader');
+const info = loadFormat('./formats/example_marketing.json');
+// info.format, info.hash, info.id, info.version
 ```
 
 ---

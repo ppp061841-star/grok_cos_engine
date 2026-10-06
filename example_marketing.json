@@ -1,0 +1,87 @@
+{
+  "identity": {
+    "id": "marketing-cos",
+    "name": "Marketing Chief of Staff",
+    "version": "1.0.0",
+    "description": "Restrict-only format for marketing research, analysis, content drafting and critique. Raises evidence expectations and forces human review for medium+ risk."
+  },
+  "specialists": [
+    {
+      "id": "market_researcher",
+      "base_role": "researcher",
+      "display_name": "Market Researcher",
+      "prompt_file": "prompts/market_researcher.md"
+    },
+    {
+      "id": "analyst",
+      "base_role": "analyst",
+      "display_name": "Strategy Analyst",
+      "prompt_file": "prompts/analyst.md"
+    },
+    {
+      "id": "content_creator",
+      "base_role": "creator",
+      "display_name": "Content Creator",
+      "prompt_file": "prompts/content.md"
+    },
+    {
+      "id": "critic",
+      "base_role": "critic",
+      "display_name": "Quality Critic",
+      "prompt_file": "prompts/critic.md"
+    }
+  ],
+  "mission_types": [
+    {
+      "id": "campaign_brief",
+      "label": "Campaign Brief",
+      "chain": ["researcher", "analyst", "creator", "critic"],
+      "risk_floor": "medium",
+      "input_schema": {
+        "objective": "string",
+        "target_audience": "string",
+        "channels": "array"
+      }
+    },
+    {
+      "id": "competitive_scan",
+      "label": "Competitive Scan",
+      "chain": ["researcher", "analyst", "critic"],
+      "risk_floor": "low"
+    }
+  ],
+  "risk_policy": {
+    "floor": "low"
+  },
+  "approval_policy": {
+    "require_human_for": ["medium", "high"],
+    "min_approvers": 1
+  },
+  "evidence_policy": {
+    "min_sources": 2,
+    "min_snippet_chars": 24,
+    "require_freshness_days": 90
+  },
+  "verification_extras": [
+    "nonce_in_artifact",
+    "grounding_containment"
+  ],
+  "tools_requested": [
+    "web_fetch"
+  ],
+  "priorities": {
+    "accuracy": 10,
+    "speed": 4,
+    "creativity": 6
+  },
+  "terminology": {
+    "artifact": "deliverable",
+    "claim": "insight"
+  },
+  "presentation": {
+    "dashboard_title": "Marketing CoS"
+  },
+  "defaults": {
+    "seed_url_hint": "https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/main/README.md"
+  }
+}

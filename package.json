@@ -1,13 +1,27 @@
 {
   "name": "cos-grok-engine",
-  "version": "1.0.0-grok",
+  "version": "1.1.0-grok",
   "private": true,
-  "description": "Grok COS Engine \u2014 safety-first LLM specialist orchestration with immutable control chain and restrict-only formats",
+  "description": "Grok COS Engine — safety-first LLM specialist orchestration with immutable control chain and restrict-only formats",
   "main": "cos_backend.js",
   "scripts": {
-    "start": "node cos_backend.js"
+    "start": "node cos_backend.js",
+    "test": "node --test tests/",
+    "test:live": "node tests/test19_live_mission.js",
+    "test:format": "node tests/test_format_loader.js",
+    "test:gate": "node tests/test_gate.js",
+    "init-db": "node -e \"const {DatabaseSync}=require('node:sqlite');const fs=require('fs');const db=new DatabaseSync(process.env.COS_DB||'./cos.db');db.exec(fs.readFileSync('./test17_schema.sql','utf8'));console.log('DB initialized');\""
   },
   "engines": {
     "node": ">=22.5.0"
-  }
+  },
+  "keywords": [
+    "cos",
+    "chief-of-staff",
+    "llm-orchestration",
+    "safety",
+    "xai",
+    "grok"
+  ],
+  "license": "UNLICENSED"
 }

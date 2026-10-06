@@ -1,37 +1,16 @@
 /**
- * mission_chain.js
+ * mission_chain.js — Grok COS Engine v1.1.0
  *
- * The real (non-mock) Researcher -> Analyst -> Creator -> Critic -> approval
- * chain, extracted so cos_backend.js can run it per-request against a
- * phone-submitted mission (Test 19), instead of only reading rows a CLI
- * script already wrote.
- *
- * This deliberately mirrors test17_final_acceptance.js's live path
- * (callGeminiLive / callGroqLive / callWithFallback / the risk-classifier and
- * approval-gate logic) rather than reinventing it — same schema, same
- * fetch-then-generate grounding design, same "software risk tier is
- * authoritative" rule, same execute() that refuses without a genuine
- * APPROVED row. Nothing about the approval boundary changes for Test 19.
- *
- * Test 19's nonce requirement is handled two ways so it shows up in more
- * than one persisted place, not just the objective text the phone already
- * sent:
- *   1. The Researcher is asked to echo the nonce back as a distinct
- *      "verification_token" field. That field is only satisfied if Gemini's
- *      own response contains it — it is stored verbatim in
- *      provider_calls.raw_output (the actual provider-generated response).
- *   2. The Creator is asked to include the nonce in the artifact payload
- *      itself, so it is visible directly on the dashboard's Research/
- *      Artifacts view, not just buried in a raw JSON blob.
- *
- * Requires GEMINI_API_KEY. GROQ_API_KEY is optional — without it, Gemini is
- * the only provider (no fallback, matching how Test 16/17 treat a
- * single-provider list: a Gemini failure just fails the call).
+ * Researcher → Analyst → Creator → Critic → approval chain.
+ * Control chain is engine-owned and immutable.
+ * Formats are restrict-only data (see format_loader.js).
  */
 
 'use strict';
+
 const crypto = require('crypto');
 const { callWithFallback, toProviderCallRow } = require('./provider_fallback');
+const { loadDefaultFormat, applyRiskFloor } = require('./format_loader');
 
 function nowISO() { return new Date().toISOString(); }
 function uuid() { return crypto.randomUUID(); }
@@ -60,16 +39,7 @@ function computeRiskTierFromClaims(claims) {
   return tier;
 }
 
-/* ---------------- real provider calls (same shape as Test 17 --live) ---------------- */
-
-// Both callers attach usage accounting under a reserved "__usage" key on the
-// parsed response object. This is Google's / Groq's own server-side token
-// accounting for THIS specific call, returned inline in the same HTTP
-// response — not a separate dashboard, but it is data the provider computed,
-// not data our app invented, and a canned/mocked handler would have to fake
-// plausible token counts matching the actual prompt length to fabricate it.
-// validate() functions below only inspect known fields, so this extra key is
-// inert everywhere else it flows (recommendations/artifacts inserts, etc).
+/* ---------------- real provider calls ---------------- */
 
 async function callGeminiLive({ apiKey, model }, prompt, schemaHint) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -127,11 +97,6 @@ function validateResearcher(nonce) {
       typeof c.source_url === 'string' && typeof c.evidence_snippet === 'string' &&
       typeof c.confidence === 'number') &&
     resp.verification_token === nonce &&
-    // Also require the nonce inside claims[0].text itself (not just the
-    // separate verification_token field), since claims.text is what the
-    // dashboard's Research view actually displays — this is what makes the
-    // nonce visible in "the resulting record" on a fresh dashboard read,
-    // not just buried in a raw_output blob.
     resp.claims[0].text.includes(nonce);
 }
 function validateAnalyst(resp) {
@@ -144,7 +109,7 @@ function validateCreator(nonce) {
     resp.payload.includes(nonce);
 }
 
-/* ---------------- DB writes (identical shapes to test17_final_acceptance.js) ---------------- */
+/* ---------------- DB helpers ---------------- */
 
 async function runProviderCall(db, { missionId, callSeq, specialist, prompt, validate, providers }) {
   const result = await callWithFallback({ prompt, validate, meta: { missionId, callSeq, specialist } }, providers);
@@ -162,11 +127,6 @@ function recordDecision(db, missionId, status, rationale) {
     .run(missionId, status, rationale, nowISO());
 }
 
-/**
- * Real, server-side fetch (no CORS, matches Test 17's fix). Grounds the
- * Researcher call in genuinely fetched content instead of trusting Gemini to
- * name a source_url after the fact.
- */
 async function fetchGrounding(seedUrl) {
   try {
     const res = await fetch(seedUrl);
@@ -177,7 +137,9 @@ async function fetchGrounding(seedUrl) {
   }
 }
 
-async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedUrl, keys, models }) {
+/* ---------------- specialists ---------------- */
+
+async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedUrl, keys, models, minSnippet = 12 }) {
   const grounding = await fetchGrounding(seedUrl);
   const prompt = `You are a research specialist. Task: ${requestText}\n\n` +
     `Reference material (already fetched server-side — treat as grounding evidence, do not invent a different source_url):\n---\n${grounding.content.slice(0, 4000)}\n---\n` +
@@ -197,14 +159,11 @@ async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedU
   const claimIds = [];
   const claims = Array.isArray(result.response?.claims) ? result.response.claims : [];
   for (const c of claims) {
-    // Same code-enforced containment check as Test 17: a claim only counts as
     // I-1: snippet must be non-empty, long enough, and actually present in fetched bytes.
-    // Empty string must NEVER count as grounded (includes('') === true is a classic foot-gun).
     const snippet = (c.evidence_snippet || '').trim();
-    const MIN_SNIPPET = 12; // require meaningful evidence, not a single character or empty
     const fetchMatch = (
       grounding.bytes > 0 &&
-      snippet.length >= MIN_SNIPPET &&
+      snippet.length >= minSnippet &&
       grounding.content.includes(snippet.slice(0, Math.min(80, snippet.length)))
     ) ? 1 : 0;
     const ins = db.prepare(`
@@ -221,9 +180,12 @@ async function runResearcher(db, { missionId, callSeq, requestText, nonce, seedU
   return { claimIds, fallbackTriggered: result.fallbackTriggered, providerUsed: result.providerUsed, tokenVerified, usage };
 }
 
-async function runAnalyst(db, { missionId, callSeq, requestText, claimIds, keys, models }) {
+async function runAnalyst(db, { missionId, callSeq, requestText, claimIds, keys, models, format }) {
   const claims = claimIds.map((id) => db.prepare(`SELECT * FROM claims WHERE id = ?`).get(id));
   let riskTier = computeRiskTierFromClaims(claims);
+
+  // Apply format risk floor (escalate-only)
+  riskTier = applyRiskFloor(riskTier, format);
 
   const prompt = `You are an analyst. Summarize these grounded research claims for the task: ${requestText}\n\n` +
     `Claims:\n${claims.map((c) => `- ${c.text}`).join('\n')}`;
@@ -232,16 +194,20 @@ async function runAnalyst(db, { missionId, callSeq, requestText, claimIds, keys,
     missionId, callSeq, specialist: 'analyst', prompt, validate: validateAnalyst, providers,
   });
 
-  if (containsInjectionPattern(result.response?.summary)) riskTier = maxTier(riskTier, 'high');
+  if (containsInjectionPattern(result.response?.summary)) {
+    riskTier = maxTier(riskTier, 'high');
+  }
 
   const ins = db.prepare(`
     INSERT INTO recommendations (mission_id, provider_call_id, claim_ids, summary, llm_self_tier, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(missionId, providerCallId, JSON.stringify(claimIds), result.response.summary, result.response.llm_self_tier, nowISO());
-const cur = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
-riskTier = maxTier(cur, riskTier);
-db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
+
+  // Single authoritative update (fixed duplicate)
+  const cur = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
+  riskTier = maxTier(cur, riskTier);
   db.prepare(`UPDATE missions SET risk_tier = ? WHERE id = ?`).run(riskTier, missionId);
+
   const usage = result.response && result.response.__usage ? result.response.__usage : null;
   recordDecision(db, missionId, 'ANALYZED',
     `risk_tier=${riskTier} llm_self_tier=${result.response.llm_self_tier} fallback_triggered=${result.fallbackTriggered} usage=${JSON.stringify(usage)}`);
@@ -271,7 +237,7 @@ async function runCreator(db, { missionId, callSeq, requestText, nonce, recommen
   return { artifactId: Number(ins.lastInsertRowid), fallbackTriggered: result.fallbackTriggered, nonceInPayload, usage };
 }
 
-// Deterministic — not an LLM call, same as Test 17's scenario-defined Critic.
+// Deterministic Critic — never an LLM call that can approve or terminate.
 function runCritic(db, { missionId, artifactId, claims, grounded, nonceInPayload }) {
   const injected = claims.some((c) => containsInjectionPattern(c.text));
   const allGrounded = grounded && claims.every((c) => c.fetch_match === 1);
@@ -291,11 +257,12 @@ function runCritic(db, { missionId, artifactId, claims, grounded, nonceInPayload
   return verdict;
 }
 
-// The approval boundary — same function shape as cos_backend.js's gateExecute.
-// Only place EXECUTED is written; re-reads APPROVED from the DB.
+/**
+ * Unified execution gate (I-4).
+ * Only place EXECUTED is written. Re-reads APPROVED and refuses if a later REJECTED exists.
+ * Identical logic to cos_backend.js gateExecute.
+ */
 function execute(db, missionId) {
-  // Unified gate (I-4): re-read APPROVED and refuse if a later REJECTED exists.
-  // Same logic as cos_backend.js gateExecute — single source of truth for the boundary.
   const row = db.prepare(`SELECT id FROM decisions WHERE mission_id = ? AND status = 'APPROVED' ORDER BY id DESC LIMIT 1`).get(missionId);
   if (!row) throw new Error(`BOUNDARY VIOLATION BLOCKED: mission ${missionId} has no APPROVED decision row — execution refused`);
   const later = db.prepare(`SELECT 1 FROM decisions WHERE mission_id = ? AND id > ? AND status = 'REJECTED'`).get(missionId, row.id);
@@ -308,62 +275,104 @@ function execute(db, missionId) {
 }
 
 /**
- * Runs one full live mission through the real chain. Throws on any hard
- * failure (missing keys, schema validation failure after fallback exhausted,
- * etc.) rather than silently degrading — a caller that wants a "demo" result
- * must not be able to get one from this function.
- *
- * @returns full result object including every id, so the caller (backend
- *          route) can reply with something the phone can immediately check
- *          against a GET /api/snapshot read, without re-deriving anything.
+ * Runs one full live mission through the real chain.
+ * Formats are loaded and recorded; they can only raise risk floors.
  */
-async function runLiveMission(db, { requestText, nonce, seedUrl, keys, models }) {
+async function runLiveMission(db, {
+  requestText,
+  nonce,
+  seedUrl,
+  keys,
+  models,
+  formatSource = null,   // path or object; null → default
+  baseDir = null,
+}) {
   if (!keys || !keys.gemini) throw new Error('GEMINI_API_KEY is not configured on the server — cannot run a live mission');
-  const missionId = uuid();
-  db.prepare(`INSERT INTO missions (id, request_text, status, risk_tier, created_at) VALUES (?, ?, 'PROPOSED', 'low', ?)`)
-    .run(missionId, requestText, nowISO());
-  recordDecision(db, missionId, 'PROPOSED', requestText);
-try {
-  const research = await runResearcher(db, { missionId, callSeq: 1, requestText, nonce, seedUrl, keys, models });
-  const claims = research.claimIds.map((id) => db.prepare(`SELECT * FROM claims WHERE id = ?`).get(id));
-  const analysis = await runAnalyst(db, { missionId, callSeq: 2, requestText, claimIds: research.claimIds, keys, models });
-  const creation = await runCreator(db, { missionId, callSeq: 3, requestText, nonce, recommendationId: analysis.recommendationId, keys, models });
-  const criticVerdict = runCritic(db, {
-    missionId, artifactId: creation.artifactId, claims,
-    grounded: claims.length > 0, nonceInPayload: creation.nonceInPayload,
-  });
 
-  const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
-  const autoEligible = riskTier === 'low' && criticVerdict === 'PASS';
-
-  let outcome;
-  if (autoEligible) {
-    recordDecision(db, missionId, 'APPROVED', 'auto: low risk tier + critic PASS, no human input required');
-    execute(db, missionId);
-    outcome = 'AUTO_COMPLETED';
-  } else {
-    recordDecision(db, missionId, 'AWAITING_APPROVAL', `risk_tier=${riskTier} critic_verdict=${criticVerdict}`);
-    outcome = 'AWAITING_APPROVAL';
+  // Load format (restrict-only)
+  let formatInfo;
+  try {
+    if (formatSource) {
+      const { loadFormat } = require('./format_loader');
+      formatInfo = loadFormat(formatSource);
+    } else {
+      formatInfo = loadDefaultFormat(baseDir);
+    }
+  } catch (e) {
+    throw new Error(`Format load failed: ${e.message}`);
   }
+  const format = formatInfo.format;
+  const minSnippet = (format.evidence_policy && format.evidence_policy.min_snippet_chars) || 12;
 
-  return {
+  const missionId = uuid();
+  db.prepare(`
+    INSERT INTO missions (id, request_text, status, risk_tier, created_at, format_id, format_version, format_manifest_hash)
+    VALUES (?, ?, 'PROPOSED', 'low', ?, ?, ?, ?)
+  `).run(
     missionId,
-    riskTier,
-    criticVerdict,
-    outcome,
-    providerUsed: creation.fallbackTriggered ? 'groq' : research.providerUsed,
-    researcherProviderUsed: research.providerUsed,
-    fallbackTriggered: research.fallbackTriggered || analysis.fallbackTriggered || creation.fallbackTriggered,
-    nonceVerifiedInProviderResponse: research.tokenVerified,
-    nonceVerifiedInArtifact: creation.nonceInPayload,
-    claimCount: claims.length,
-    // Server-side token accounting returned inline by each provider for this
-    // specific call (see callGeminiLive/callGroqLive) — supporting evidence
-    // for "independent" confirmation, though it still arrives via our own
-    // backend rather than Google's separate usage dashboard.
-    tokenUsage: { researcher: research.usage, analyst: analysis.usage, creator: creation.usage },
-  };
-  } catch (e) { e.missionId = missionId; throw e; }
+    requestText,
+    nowISO(),
+    formatInfo.id,
+    formatInfo.version,
+    formatInfo.hash,
+  );
+  recordDecision(db, missionId, 'PROPOSED', requestText);
+
+  try {
+    const research = await runResearcher(db, {
+      missionId, callSeq: 1, requestText, nonce, seedUrl, keys, models, minSnippet,
+    });
+    const claims = research.claimIds.map((id) => db.prepare(`SELECT * FROM claims WHERE id = ?`).get(id));
+    const analysis = await runAnalyst(db, {
+      missionId, callSeq: 2, requestText, claimIds: research.claimIds, keys, models, format,
+    });
+    const creation = await runCreator(db, {
+      missionId, callSeq: 3, requestText, nonce, recommendationId: analysis.recommendationId, keys, models,
+    });
+    const criticVerdict = runCritic(db, {
+      missionId, artifactId: creation.artifactId, claims,
+      grounded: claims.length > 0, nonceInPayload: creation.nonceInPayload,
+    });
+
+    const riskTier = db.prepare(`SELECT risk_tier FROM missions WHERE id = ?`).get(missionId).risk_tier;
+    const autoEligible = riskTier === 'low' && criticVerdict === 'PASS';
+
+    let outcome;
+    if (autoEligible) {
+      recordDecision(db, missionId, 'APPROVED', 'auto: low risk tier + critic PASS, no human input required');
+      execute(db, missionId);
+      outcome = 'AUTO_COMPLETED';
+    } else {
+      recordDecision(db, missionId, 'AWAITING_APPROVAL', `risk_tier=${riskTier} critic_verdict=${criticVerdict}`);
+      outcome = 'AWAITING_APPROVAL';
+    }
+
+    return {
+      missionId,
+      riskTier,
+      criticVerdict,
+      outcome,
+      formatId: formatInfo.id,
+      formatVersion: formatInfo.version,
+      formatHash: formatInfo.hash,
+      providerUsed: creation.fallbackTriggered ? 'groq' : research.providerUsed,
+      researcherProviderUsed: research.providerUsed,
+      fallbackTriggered: research.fallbackTriggered || analysis.fallbackTriggered || creation.fallbackTriggered,
+      nonceVerifiedInProviderResponse: research.tokenVerified,
+      nonceVerifiedInArtifact: creation.nonceInPayload,
+      claimCount: claims.length,
+      tokenUsage: { researcher: research.usage, analyst: analysis.usage, creator: creation.usage },
+    };
+  } catch (e) {
+    e.missionId = missionId;
+    throw e;
+  }
 }
 
-module.exports = { runLiveMission, runAnalyst, execute, computeRiskTierFromClaims, containsInjectionPattern };
+module.exports = {
+  runLiveMission,
+  runAnalyst,
+  execute,
+  computeRiskTierFromClaims,
+  containsInjectionPattern,
+};
